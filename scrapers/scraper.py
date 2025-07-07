@@ -1,0 +1,138 @@
+import asyncio
+import json
+import uuid
+import random
+from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
+import sys
+import os
+
+# Add the parent directory to the Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from utils import user_agents
+
+async def scrape_msdvetmanual():
+    """
+    Scrapes text content from the 'Dog Owners' section of the MSD Vet Manual website.
+    It navigates to main categories, then to their subsections, extracts text,
+    and saves it into a JSON file formatted for a vector database.
+    """
+    base_url = "https://www.msdvetmanual.com/dog-owners"
+    scraped_data = []
+
+    async with async_playwright() as p:
+        
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(user_agent=random.choice(user_agents))
+
+        print(f"Navigating to base URL: {base_url}")
+
+        await page.goto(base_url, wait_until="domcontentloaded")
+        
+        all_links = await page.locator("a").all()
+        main_category_links = []
+        
+        for link_element in all_links:
+            href = await link_element.get_attribute("href")
+            text = await link_element.text_content()
+            
+            if href and href.startswith("/dog-owners/") and href != "/dog-owners" and '#' not in href:
+                path_segments = href.strip('/').split('/')
+                if len(path_segments) == 2 and path_segments[0] == 'dog-owners':
+                    full_url = f"https://www.msdvetmanual.com{href}"
+                    main_category_links.append({"text": text.strip(), "url": full_url})
+
+        # Use a dictionary to remove duplicate links based on their URL
+        unique_main_category_links = {link['url']: link for link in main_category_links}.values()
+        print(f"Found {len(unique_main_category_links)} potential main categories.")
+        
+        for main_cat_link_info in unique_main_category_links:
+            main_category_name = main_cat_link_info["text"]
+            main_category_url = main_cat_link_info["url"]
+
+            print(f"\n--- Processing Main Category: {main_category_name} ({main_category_url}) ---")
+            
+            await page.goto(main_category_url, wait_until="domcontentloaded")
+            
+            all_links_on_category_page = await page.locator("a").all()
+            subsection_links = []
+
+            for link_element in all_links_on_category_page:
+                href = await link_element.get_attribute("href")
+                text = await link_element.text_content()
+
+                main_category_path_segment = main_cat_link_info["url"].replace("https://www.msdvetmanual.com", "")
+                if href and href.startswith(main_category_path_segment + '/') and '#' not in href:
+                    path_segments = href.strip('/').split('/')
+                    if len(path_segments) == 3 and path_segments[0] == 'dog-owners' and path_segments[1] == main_category_path_segment.strip('/').split('/')[-1]:
+                        full_url = f"https://www.msdvetmanual.com{href}"
+                        # Ensure we don't add the main category URL itself as a subsection
+                        if full_url != main_category_url:
+                            subsection_links.append({"text": text.strip(), "url": full_url})
+            
+            unique_subsection_links = {link['url']: link for link in subsection_links}.values()
+            
+            print(f"Found {len(unique_subsection_links)} potential subsections for '{main_category_name}'.")
+
+            for sub_link_info in unique_subsection_links:
+                subsection_name = sub_link_info["text"]
+                subsection_url = sub_link_info["url"]
+
+                print(f"--- Scraping Subsection: '{subsection_name}' ({subsection_url}) ---")
+                
+                try:
+                    await page.goto(subsection_url, wait_until="domcontentloaded")
+                    
+                    content_locator = page.locator("div.TopicMainContent_content__MEmoN").first
+                    if content_locator:
+                        html_content = await content_locator.inner_html()
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        
+                        # Remove all <img> tags
+                        for img_tag in soup.find_all('img'):
+                            img_tag.decompose()
+                        
+                        # Remove all <h2> tags
+                        for h2_tag in soup.find_all('h2'):
+                            h2_tag.decompose()
+
+                        # Remove all <h3> tags
+                        for h3_tag in soup.find_all('h3'):
+                            h3_tag.decompose()
+
+                        full_text = soup.get_text()
+
+                    
+                    if full_text:
+                        
+                        cleaned_text = ' '.join(full_text.split()).strip()
+                        
+                        scraped_data.append({
+                            "id": str(uuid.uuid4()), # Unique ID for each text chunk
+                            "url": subsection_url,
+                            "chapter": main_category_name,
+                            "topic": subsection_name,
+                            "text": cleaned_text
+                        })
+                        print(f"Successfully scraped '{subsection_name}'.")
+                    else:
+                        print(f"WARNING: Could not find main content element for '{subsection_name}' at {subsection_url}. Skipping.")
+
+                except Exception as e:
+                    print(f"ERROR: Failed to scrape '{subsection_url}': {e}")
+                
+        await browser.close()
+
+    output_filename = "data/msdvetmanual_dog_owners_data.json"
+    with open(output_filename, "w", encoding="utf-8") as f:
+        json.dump(scraped_data, f, ensure_ascii=False, indent=2)
+    
+    print(f"\nScraping complete. Data saved to {output_filename}")
+    print(f"Total entries scraped: {len(scraped_data)}")
+
+def main():
+    asyncio.run(scrape_msdvetmanual())
+
+if __name__ == "__main__":
+    main()
